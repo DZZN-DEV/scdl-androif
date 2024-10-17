@@ -99,6 +99,15 @@ from functools import lru_cache
 from types import TracebackType
 from typing import IO, Generator, List, NoReturn, Optional, Set, Tuple, Type, Union
 
+
+# Check for mobile-ffmpeg installation
+try:
+    from com.arthenica.mobileffmpeg import FFmpeg
+except ImportError:
+    print("Error: The 'com.arthenica.mobileffmpeg' library is not installed.")
+    print("Please install it using the following command:")
+    sys.exit(1)
+    
 from tqdm import tqdm
 
 if sys.version_info < (3, 8):
@@ -1459,8 +1468,8 @@ def _get_ffmpeg_pipe(
     should_copy: bool,
     output_file: str,
     kwargs: SCDLArgs,
-) -> subprocess.Popen:
-    logger.info("Creating the ffmpeg pipe...")
+) -> None:
+    logger.info("Creating the ffmpeg command...")
 
     commands = build_ffmpeg_encoding_args(
         in_data if isinstance(in_data, str) else "-",
@@ -1478,14 +1487,7 @@ def _get_ffmpeg_pipe(
     )
 
     logger.debug(f"ffmpeg command: {' '.join(commands)}")
-    return subprocess.Popen(
-        commands,
-        stdin=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        bufsize=FFMPEG_PIPE_CHUNK_SIZE,
-    )
-
+    return commands  # Adjusted to return commands instead of running them
 
 def _is_unsupported_codec_for_streaming(codec: str) -> bool:
     return codec in ("ipod", "flac")
@@ -1499,91 +1501,23 @@ def _re_encode_ffmpeg(
     should_copy: bool,
     kwargs: SCDLArgs,
 ) -> io.BytesIO:
-    pipe = _get_ffmpeg_pipe(in_data, out_codec, should_copy, out_file_name, kwargs)
+    # Prepare the ffmpeg command
+    commands = _get_ffmpeg_pipe(in_data, out_codec, should_copy, out_file_name, kwargs)
 
     logger.info("Encoding..")
     errors_output = ""
-    stdout = io.BytesIO()
 
-    # Sadly, we have to iterate both stdout and stderr at the same times in order for
-    # things to work. This is why we have 2 threads that are reading stderr, and
-    # writing stuff to stdin at the same time. I don't think there is any other way
-    # to get this working and make it as fast as it is now.
+    # Execute the command using FFmpeg
+    result_code = FFmpeg.execute(*commands)
 
-    # A function that reads encoded track to our `stdout` BytesIO object
-    def read_stdout() -> None:
-        assert pipe.stdout is not None
-        shutil.copyfileobj(pipe.stdout, stdout, FFMPEG_PIPE_CHUNK_SIZE)
-        pipe.stdout.close()
+    if result_code != 0:
+        raise FFmpegError(result_code, errors_output)
 
-    stdout_thread = None
-    stdin_thread = None
+    # Read from the output file if needed
+    with open(out_file_name, "rb") as f:
+        output_data = io.BytesIO(f.read())
 
-    # Read from stdout only if we expect ffmpeg to write something there
-    if out_file_name == "pipe:1":
-        stdout_thread = threading.Thread(target=read_stdout, daemon=True)
-
-    # Stream the response to ffmpeg if needed
-    if isinstance(in_data, requests.Response):
-        assert pipe.stdin is not None
-        stdin_thread = threading.Thread(
-            target=_write_streaming_response_to_pipe,
-            args=(in_data, pipe.stdin, kwargs),
-            daemon=True,
-        )
-
-    # Start the threads
-    if stdout_thread:
-        stdout_thread.start()
-    if stdin_thread:
-        stdin_thread.start()
-
-    # Read progress from stderr line by line
-    hide_progress = bool(kwargs.get("hide_progress"))
-    total_sec = track_duration_ms / 1000
-    with tqdm(total=total_sec, disable=hide_progress, unit="s") as progress:
-        last_secs = 0.0
-        assert pipe.stderr is not None
-        for line in io.TextIOWrapper(pipe.stderr, encoding="utf-8", errors=None):
-            parameters = line.split("=", maxsplit=1)
-            if hide_progress or not _is_ffmpeg_progress_line(parameters):
-                errors_output += line
-                continue
-
-            if not line.startswith("out_time_ms"):
-                continue
-
-            try:
-                seconds = int(parameters[1]) / 1_000_000
-            except ValueError:
-                seconds = 0.0
-
-            seconds = min(seconds, total_sec)  # clamp just to be sure
-            changed = seconds - last_secs
-            last_secs = seconds
-            progress.update(changed)
-
-    # Wait for threads to finish
-    if stdout_thread:
-        stdout_thread.join()
-    if stdin_thread:
-        stdin_thread.join()
-
-    logger.debug(f"FFmpeg output: {errors_output}")
-
-    # Make sure that process has exited and get its exit code
-    pipe.wait()
-    if pipe.returncode != 0:
-        raise FFmpegError(pipe.returncode, errors_output)
-
-    # Read from the temp file, if needed
-    if out_file_name != "pipe:1":
-        with open(out_file_name, "rb") as f:
-            shutil.copyfileobj(f, stdout)
-
-    stdout.seek(0)
-    return stdout
-
+    return output_data
 
 def _copy_stream(
     in_data: requests.Response,  # streaming response or url
@@ -1630,23 +1564,22 @@ def re_encode_to_buffer(
 
 @lru_cache(maxsize=1)
 def get_ffmpeg_supported_options() -> Set[str]:
-    """Returns supported ffmpeg options which we care about"""
-    if shutil.which("ffmpeg") is None:
-        logger.error("ffmpeg is not installed")
-        sys.exit(1)
-    r = subprocess.run(
-        ["ffmpeg", "-help", "long", "-loglevel", "quiet"],
-        check=True,
-        stdout=subprocess.PIPE,
-        encoding="utf-8",
-    )
-    supported = set()
-    for line in r.stdout.splitlines():
-        if line.startswith("-"):
-            opt = line.split(maxsplit=1)[0]
-            supported.add(opt)
-    return supported
+    """Returns a predefined set of commonly used FFmpeg options."""
+    # Define a set of commonly used FFmpeg options
+    supported_options = {
+        "-i",          # Input file
+        "-c",          # Codec
+        "-f",          # Format
+        "-loglevel",   # Log level
+        "-progress",   # Progress output
+        "-stats_period" # Stats period for progress updates
+        # You can add more options if necessary
+    }
 
+    # Log the supported options
+    logger.info("Supported FFmpeg options: %s", supported_options)
+
+    return supported_options
 
 if __name__ == "__main__":
     main()
